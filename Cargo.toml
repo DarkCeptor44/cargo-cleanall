@@ -1,0 +1,42 @@
+[package]
+name = "cargo-cleanall"
+description = "Cleans all project builds"
+version = "1.0.0"
+authors = ["DarkCeptor44"]
+edition = "2021"
+rust-version = "1.80"
+license = "GPL-3.0-or-later"
+homepage = "https://docs.rs/crate/cargo-cleanall"
+repository = "https://github.com/DarkCeptor44/cargo-cleanall"
+keywords = ["cargo", "clean", "project", "builds", "terminal"]
+categories = [
+    "command-line-utilities",
+    "development-tools",
+    "development-tools::cargo-plugins",
+]
+
+[dependencies]
+anyhow = "^1"
+clap = { version = "^4", features = ["derive"] }
+colored = "^3"
+rayon = "^1"
+
+[dev-dependencies]
+divan = "^0.1"
+tempfile = "^3"
+
+[profile.dev]
+opt-level = 1
+codegen-units = 16
+debug = true
+incremental = true
+
+[profile.release]
+lto = true
+codegen-units = 1
+opt-level = 3
+strip = true
+
+[[bench]]
+name = "bench"
+harness = false
