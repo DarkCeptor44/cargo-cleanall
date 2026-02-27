@@ -2,6 +2,13 @@
 
 Clean all project builds by running `cargo clean` in all directories that have a `Cargo.toml` file in them. The search is not recursive and will only clean the top level directories in the path.
 
+## MSRV
+
+| Version | MSRV | Edition |
+|:-------:|:----:| :-----: |
+| 1.1.x   | 1.85 |  2024   |
+| 1.0.x   | 1.80 |  2021   |
+
 ## Getting Started
 
 The `cargo-cleanall` CLI can be installed with the following command:

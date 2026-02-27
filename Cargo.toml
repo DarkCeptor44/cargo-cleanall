@@ -1,10 +1,10 @@
 [package]
 name = "cargo-cleanall"
 description = "Cleans all project builds"
-version = "1.0.0"
+version = "1.1.0"
 authors = ["DarkCeptor44"]
-edition = "2021"
-rust-version = "1.80"
+edition = "2024"
+rust-version = "1.85"
 license = "GPL-3.0-or-later"
 homepage = "https://github.com/DarkCeptor44/cargo-cleanall"
 repository = "https://github.com/DarkCeptor44/cargo-cleanall"
