@@ -4,163 +4,134 @@
 //!
 //! ## Getting Started
 //!
-//! Run `cargo add cargo-cleanall` or add the following to your `Cargo.toml`:
+//! Run `cargo add --git https://github.com/DarkCeptor44/cargo-cleanall` or add the following to your `Cargo.toml`:
 //!
 //! ```toml
 //! [dependencies]
-//! cargo-cleanall = "^1"
+//! cargo-cleanall = { version = "2.0.0", git = "https://github.com/DarkCeptor44/cargo-cleanall" }
 //! ```
 //!
 //! ## Library Usage
 //!
-//! ```rust,no_run
+//! ```rust,ignore
 //! use cargo_cleanall::get_cargo_projects;
 //!
-//! let (dirs, elapsed) = get_cargo_projects("path/to/directory").unwrap(); // returns a list of directories that have a Cargo.toml file in them and the time it took to find them
+//! // returns a list of directories that have a Cargo.toml file in them
+//! let dirs = get_cargo_projects("path/to/directory").await.unwrap();
 //! ```
 //!
-//! ```rust,no_run
-//! use cargo_cleanall::clean_all;
+//! ```rust,ignore
+//! use cargo_cleanall::clean_dir;
 //!
-//! clean_all("path/to/directory", false, true).unwrap(); // cleans all project builds without dry run and prints details about the cleaning process
+//! // cleans the project build with a cargo command
+//! let cleaned = clean_dir("path/to/directory", false, false).await.unwrap();
+//!
+//! // cleans the project build by directly removing the target directory, this is way faster
+//! let cleaned = clean_dir("path/to/directory", true, false).await.unwrap();
 //! ```
 //!
 //! ## Benchmarks
 //!
 //! ```bash
 //! Timer precision: 100 ns
-//! bench                  fastest       │ slowest       │ median        │ mean          │ samples │ iters
-//! ├─ clean_all                         │               │               │               │         │
-//! │  ├─ 5                222.7 ms      │ 538.4 ms      │ 461.6 ms      │ 464.5 ms      │ 100     │ 100
-//! │  ╰─ 10               294.5 ms      │ 788.2 ms      │ 615.5 ms      │ 626.7 ms      │ 100     │ 100
-//! ╰─ get_cargo_projects                │               │               │               │         │
-//!    ├─ 10               177.9 µs      │ 270 µs        │ 208 µs        │ 207.9 µs      │ 100     │ 100
-//!    ├─ 100              590.6 µs      │ 1.025 ms      │ 651.7 µs      │ 663.2 µs      │ 100     │ 100
-//!    ╰─ 200              1.024 ms      │ 1.586 ms      │ 1.102 ms      │ 1.117 ms      │ 100     │ 100
+//! bench                       fastest       │ slowest       │ median        │ mean          │ samples │ iters
+//! ├─ clean_dir (cargo clean)  125.9 ms      │ 141.5 ms      │ 131.7 ms      │ 132.1 ms      │ 100     │ 100
+//! ├─ clean_dir (fast)         275.1 µs      │ 3.503 ms      │ 346.1 µs      │ 397.8 µs      │ 100     │ 100
+//! ╰─ get_cargo_projects                     │               │               │               │         │
+//!    ├─ 10                    246.3 µs      │ 673.5 µs      │ 324.1 µs      │ 352.7 µs      │ 100     │ 100
+//!    ╰─ 100                   765.8 µs      │ 3.788 ms      │ 946.4 µs      │ 1.071 ms      │ 100     │ 100
 //! ```
 
 #![forbid(unsafe_code)]
 #![warn(clippy::pedantic)]
 
-use anyhow::Result;
-use colored::Colorize;
-use rayon::iter::{IntoParallelRefIterator, ParallelBridge, ParallelIterator};
+use anyhow::{Context, Result, anyhow};
 use std::{
-    fs::{read_dir, DirEntry},
-    path::{absolute, Path},
+    io::ErrorKind,
+    path::{Path, PathBuf},
+};
+use tokio::{
+    fs::{metadata, remove_dir_all},
     process::Command,
-    sync::atomic::{AtomicUsize, Ordering},
-    time::{Duration, Instant},
+    task::JoinSet,
 };
 
-/// Cleans all project builds (`target` directory) by running `cargo clean`
-/// in all directories that have a `Cargo.toml` file in them.
+/// Cleans a project build (`target` directory) by running `cargo clean` or manually removing the `target` directory.
 ///
 /// **Note:** Only directories that have a `Cargo.toml` file and a `target` directory will be cleaned.
 ///
-/// **Note:** The search is not recursive and will only clean the top level directories in the path.
-///
 /// ## Arguments
 ///
-/// * `path` - The path to start searching from
-/// * `dry_run` - If true it will only print the commands that would be run
-/// * `verbose` - If true it will print details about the cleaning process
+/// * `path` - The path of the directory to clean
+/// * `fast` - If `true` it will remove the `target` directory directly instead of spawning a `cargo clean` command
+/// * `dry_run` - If `true` it will exit immediately after checking if `path` and `target` exist
 ///
 /// ## Errors
 ///
-/// * [`std::io::Error`] - If there is an error reading the directory
+/// Returns an error if there is an error reading the directory, if there is an error reading the file, if there is an error running the `cargo clean` command, or if there is an error removing the `target` directory
 ///
-/// ## Example
+/// ## Examples
 ///
-/// ```rust,no_run
-/// use cargo_cleanall::clean_all;
+/// ```rust,ignore
+/// use cargo_cleanall::clean_dir;
 ///
-/// clean_all("path/to/directory", false, false).unwrap();
+/// let cleaned = clean_dir("path/to/directory", false, false).await.unwrap();
 /// ```
-pub fn clean_all<P>(path: P, dry_run: bool, verbose: bool) -> Result<()>
+pub async fn clean_dir<P>(path: P, fast: bool, dry_run: bool) -> Result<bool>
 where
     P: AsRef<Path>,
 {
-    let path = path.as_ref();
-    let (mut dirs, elapsed_get) = get_cargo_projects(path)?;
-
-    dirs.retain(|dir| dir.path().join("target").is_dir());
-
-    if dirs.is_empty() {
-        if verbose {
-            println!(
-                "No Cargo projects found in {}",
-                path.display().to_string().green().bold()
-            );
-        }
-        return Ok(());
-    }
-
-    if verbose {
-        println!(
-            "{} Cargo projects found in {}\n",
-            dirs.len().to_string().green().bold(),
-            format!("{elapsed_get:.2?}").green().bold()
-        );
-    }
-
-    let count = AtomicUsize::new(0);
-    let start = Instant::now();
-    dirs.par_iter().for_each(|dir| {
-        let path = &dir.path();
-
-        if dry_run {
-            count.fetch_add(1, Ordering::SeqCst);
-            if verbose {
-                println!(
-                    "{} {}",
-                    "Would clean:".yellow().bold(),
-                    absolute(path).unwrap_or_default().display()
-                );
-            }
-            return;
-        }
-
-        let output = Command::new("cargo")
-            .arg("clean")
-            .current_dir(path)
-            .output();
-
-        if output.as_ref().map(|o| o.status.success()).unwrap_or(false) {
-            count.fetch_add(1, Ordering::SeqCst);
-            if verbose {
-                println!(
-                    "{} {}",
-                    "Cleaned:".green().bold(),
-                    absolute(path).unwrap_or_default().display()
-                );
-            }
-        } else if verbose {
-            let error_msg = output
-                .err()
-                .map_or("command failed".into(), |e| e.to_string());
-            println!(
-                "{} {} ({})",
-                "Failed to clean:".red().bold(),
-                absolute(path).unwrap_or_default().display(),
-                error_msg.red()
-            );
-        }
-    });
-
-    let elapsed = start.elapsed();
-    if verbose {
-        println!(
-            "\n{}/{} Cargo projects cleaned in {}",
-            count.load(Ordering::SeqCst).to_string().green().bold(),
-            dirs.len().to_string().green().bold(),
-            format!("{elapsed:.2?}").green().bold()
-        );
-    }
-    Ok(())
+    clean_dir_impl(path.as_ref(), fast, dry_run).await
 }
 
-/// Returns a list of directories that have a Cargo.toml file in them
+async fn clean_dir_impl(path: &Path, fast: bool, dry_run: bool) -> Result<bool> {
+    let dir_meta = metadata(path)
+        .await
+        .context("failed to get metadata for path")?;
+
+    if !dir_meta.is_dir() {
+        return Err(anyhow!("Path is not a directory: {}", path.display()));
+    }
+
+    let target_path = path.join("target");
+    let target_meta = match metadata(&target_path).await {
+        Ok(m) => m,
+        Err(e) if e.kind() == ErrorKind::NotFound => return Ok(false),
+        Err(e) => return Err(e).context("failed to get metadata for target"),
+    };
+
+    if !target_meta.is_dir() {
+        return Ok(false);
+    }
+
+    if dry_run {
+        return Ok(true);
+    }
+
+    if fast {
+        remove_dir_all(&target_path)
+            .await
+            .context("failed to remove target directory")?;
+        return Ok(true);
+    }
+
+    let output = Command::new("cargo")
+        .arg("clean")
+        .current_dir(path)
+        .output()
+        .await
+        .context("failed to build Command")?;
+
+    if output.status.success() {
+        Ok(true)
+    } else {
+        Err(anyhow!("failed to clean: {}", path.display()))
+    }
+}
+
+/// Returns a list of directories that have a `Cargo.toml` file in them
+///
+/// **Note:** The search is not recursive and will only return the top level directories in the path.
 ///
 /// ## Arguments
 ///
@@ -168,125 +139,131 @@ where
 ///
 /// ## Returns
 ///
-/// * `Vec<DirEntry>` - A list of directories that have a Cargo.toml file in them
-/// * `Duration` - The time it took to find the directories
+/// * `Result<Vec<PathBuf>>` - A list of directories that have a `Cargo.toml` file
 ///
 /// ## Errors
 ///
-/// * [`std::io::Error`] - If there is an error reading the directory
+/// Returns an error if there is an error reading the directory, or if there is an error reading the file
 ///
-/// ## Example
+/// ## Examples
 ///
-/// ```rust,no_run
+/// ```rust,ignore
 /// use cargo_cleanall::get_cargo_projects;
 ///
-/// let (dirs, elapsed) = get_cargo_projects("path/to/directory").unwrap();
+/// let dirs = get_cargo_projects("path/to/directory").await.unwrap();
 /// ```
-pub fn get_cargo_projects<P>(path: P) -> Result<(Vec<DirEntry>, Duration)>
+pub async fn get_cargo_projects<P>(path: P) -> Result<Vec<PathBuf>>
 where
     P: AsRef<Path>,
 {
-    let start = Instant::now();
-    let dirs: Vec<DirEntry> = read_dir(path)?
-        .par_bridge()
-        .filter_map(std::result::Result::ok)
-        .filter(|d| d.file_type().is_ok_and(|ft| ft.is_dir()))
-        .filter(|d| d.path().join("Cargo.toml").is_file())
-        .collect();
-    let elapsed = start.elapsed();
+    get_cargo_projects_impl(path.as_ref()).await
+}
 
-    Ok((dirs, elapsed))
+async fn get_cargo_projects_impl(path: &Path) -> Result<Vec<PathBuf>> {
+    let mut entries = tokio::fs::read_dir(path).await?;
+    let mut set = JoinSet::new();
+
+    while let Ok(Some(entry)) = entries.next_entry().await {
+        let entry_path = entry.path();
+        set.spawn(async move {
+            if let Ok(ft) = entry.file_type().await {
+                if ft.is_dir() {
+                    if let Ok(meta) = metadata(entry_path.join("Cargo.toml")).await {
+                        if meta.is_file() {
+                            return Some(entry_path);
+                        }
+                    }
+                }
+            }
+            None
+        });
+    }
+
+    let mut results = Vec::new();
+    while let Some(res) = set.join_next().await {
+        if let Ok(Some(p)) = res {
+            results.push(p);
+        }
+    }
+
+    Ok(results)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use anyhow::anyhow;
-    use std::{
-        fs::{create_dir_all, File},
-        io::Write,
-    };
-    use tempfile::tempdir;
+    use std::fs::create_dir_all;
+    use tempfile::{TempDir, tempdir};
 
-    #[test]
-    fn test_clean_all() -> Result<()> {
-        setup_test(15, |temp_path, _| {
-            clean_all(temp_path, false, false)?;
+    #[tokio::test]
+    async fn test_clean_dir_cargo() -> Result<()> {
+        let temp_dir = setup_test(15)?;
+        let dirs = get_cargo_projects(temp_dir.path()).await?;
 
-            for dir in temp_path.read_dir()?.filter_map(std::result::Result::ok) {
-                assert!(
-                    !dir.path().join("target").is_dir(),
-                    "`{}` should not have a target directory",
-                    dir.path().display()
-                );
-            }
-            Ok(())
-        })?;
+        for dir in dirs {
+            assert!(clean_dir(&dir, false, false).await?);
+            assert!(
+                !dir.join("target").is_dir(),
+                "`{}` should not have a target directory",
+                dir.display()
+            );
+        }
 
         Ok(())
     }
 
-    #[test]
-    fn test_get_cargo_projects() -> Result<()> {
-        setup_test(15, |temp_path, n| {
-            let (dirs, _) = get_cargo_projects(temp_path)?;
-            assert_eq!(dirs.len(), n);
-            Ok(())
-        })?;
+    #[tokio::test]
+    async fn test_clean_dir_fast() -> Result<()> {
+        let temp_dir = setup_test(15)?;
+        let dirs = get_cargo_projects(temp_dir.path()).await?;
+
+        for dir in dirs {
+            assert!(clean_dir(&dir, true, false).await?);
+            assert!(
+                !dir.join("target").is_dir(),
+                "`{}` should not have a target directory",
+                dir.display()
+            );
+        }
 
         Ok(())
     }
 
-    fn setup_test<F>(n: usize, f: F) -> Result<()>
-    where
-        F: Fn(&Path, usize) -> Result<()>,
-    {
+    #[tokio::test]
+    async fn test_get_cargo_projects() -> Result<()> {
+        let n = 15;
+        let temp_dir = setup_test(n)?;
+        let dirs = get_cargo_projects(temp_dir.path()).await?;
+
+        assert_eq!(dirs.len(), n);
+        for i in 0..n {
+            assert!(dirs.contains(&temp_dir.path().join(format!("dir{i}"))));
+        }
+        Ok(())
+    }
+
+    // TODO consider if its worth making this non-blocking/async
+    fn setup_test(n: usize) -> Result<TempDir> {
         let temp_dir = tempdir()?;
         let temp_path = temp_dir.path();
 
-        (0..n)
-            .par_bridge()
-            .map(|i| {
-                let dir = &temp_path.join(format!("dir{i}"));
-                create_dir_all(dir)?;
+        for i in 0..n {
+            let dir = temp_path.join(format!("dir{i}"));
+            create_dir_all(&dir)?;
 
-                let mut file = File::create(dir.join("Cargo.toml"))?;
-                file.write_all(
-                    b"[package]\nname = \"test-proj\"\nversion = \"0.1.0\"\nedition = \"2021\"",
-                )?;
-                drop(file);
+            std::fs::write(
+                dir.join("Cargo.toml"),
+                b"[package]\nname = \"test-proj\"\nversion = \"0.1.0\"\nedition = \"2024\"",
+            )?;
 
-                let src_dir = &dir.join("src");
-                create_dir_all(src_dir)?;
+            let src_dir = dir.join("src");
+            create_dir_all(&src_dir)?;
 
-                let mut src_file = File::create(src_dir.join("main.rs"))?;
-                src_file.write_all(b"fn main() {}")?;
-                drop(src_file);
+            std::fs::write(src_dir.join("main.rs"), b"fn main() {}")?;
 
-                let build_output = Command::new("cargo")
-                    .arg("build")
-                    .current_dir(dir)
-                    .output()?;
+            create_dir_all(dir.join("target"))?;
+        }
 
-                if !build_output.status.success() {
-                    eprintln!(
-                        "Failed to build test project in {}: {build_output:?}",
-                        dir.display(),
-                    );
-                    return Err(anyhow!("Cargo build failed in test setup"));
-                }
-
-                if !dir.join("target").is_dir() {
-                    return Err(anyhow!(
-                        "`{}` should have a target directory after build",
-                        dir.display()
-                    ));
-                }
-
-                Ok(())
-            })
-            .collect::<Result<Vec<_>>>()?;
-
-        f(temp_path, n)
+        Ok(temp_dir)
     }
 }

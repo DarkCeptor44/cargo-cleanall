@@ -1,113 +1,71 @@
-use cargo_cleanall::{clean_all, get_cargo_projects};
-use divan::{black_box, Bencher};
-use rayon::iter::{ParallelBridge, ParallelIterator};
-use std::{
-    fs::{create_dir_all, File},
-    io::Write,
-    path::{Path, PathBuf},
-    process::Command,
-};
-use tempfile::{tempdir, TempDir};
+use anyhow::Result;
+use cargo_cleanall::{clean_dir, get_cargo_projects};
+use divan::{Bencher, black_box};
+use std::fs::create_dir_all;
+use tempfile::{TempDir, tempdir};
+use tokio::runtime::Builder;
 
-/// Helper struct to manage the temp dirs and proj setup for benches
-struct BenchmarkSetup {
-    _temp_dir: TempDir,
-    temp_path: PathBuf,
-    num_projects: usize,
-}
-
-impl BenchmarkSetup {
-    fn new(n: usize) -> Self {
-        let temp_dir = tempdir().expect("Failed to create temp dir for benchmark setup");
-        let temp_path = temp_dir.path().to_path_buf();
-
-        (0..n).par_bridge().for_each(|i| {
-            let dir = &temp_path.join(format!("dir{i}"));
-            create_dir_all(dir).expect("Failed to create project dir");
-
-            let mut file =
-                File::create(dir.join("Cargo.toml")).expect("Failed to create Cargo.toml");
-            file.write_all(
-                b"[package]\nname = \"test-proj\"\nversion = \"0.1.0\"\nedition = \"2021\"",
-            )
-            .expect("Failed to write Cargo.toml");
-
-            let src_dir = &dir.join("src");
-            create_dir_all(src_dir).expect("Failed to create src dir");
-            let mut src_file =
-                File::create(src_dir.join("main.rs")).expect("Failed to create main.rs");
-            src_file
-                .write_all(b"fn main() {}")
-                .expect("Failed to write main.rs");
-
-            let build_output = Command::new("cargo")
-                .arg("build")
-                .current_dir(dir)
-                .output()
-                .expect("Failed to run cargo build in benchmark setup");
-
-            if !build_output.status.success() {
-                eprintln!(
-                    "Failed to build test project in {}: {build_output:?}",
-                    dir.display(),
-                );
-                panic!(
-                    "Cargo build failed in benchmark setup for {}",
-                    dir.display()
-                );
-            }
-
-            if !dir.join("target").is_dir() {
-                panic!(
-                    "`{}` should have a target directory after build",
-                    dir.display()
-                );
-            }
-        });
-
-        Self {
-            _temp_dir: temp_dir,
-            temp_path,
-            num_projects: n,
-        }
-    }
-
-    fn path(&self) -> &Path {
-        &self.temp_path
-    }
-}
+const ARGS: &[usize] = &[10, 100];
 
 fn main() {
     divan::main();
 }
 
-#[divan::bench(name="clean_all", args = [5, 10])]
-fn bench_clean_all(b: Bencher, n: usize) {
-    let setup = BenchmarkSetup::new(n);
-    let path_to_bench = setup.path();
-    let num_projects = setup.num_projects;
+#[divan::bench(name = "clean_dir (cargo clean)")]
+fn bench_clean_dir_cargo(b: Bencher) {
+    let rt = Builder::new_current_thread().enable_all().build().unwrap();
 
-    b.bench(|| {
-        (0..num_projects).par_bridge().for_each(|i| {
-            let dir = path_to_bench.join(format!("dir{i}"));
-            Command::new("cargo")
-                .arg("build")
-                .current_dir(&dir)
-                .output()
-                .expect("Failed to rebuild project for clean_all benchmark");
-        });
+    b.with_inputs(|| {
+        let temp_dir = setup_test(1).unwrap();
+        let dirs = rt.block_on(get_cargo_projects(temp_dir.path())).unwrap();
 
-        clean_all(black_box(path_to_bench), false, false).unwrap();
-        black_box(());
-    });
+        (temp_dir, dirs[0].clone())
+    })
+    .bench_local_refs(|(_t, dir)| black_box(rt.block_on(clean_dir(dir, false, false)).unwrap()));
 }
 
-#[divan::bench(name = "get_cargo_projects", args = [10, 100, 200])]
-fn bench_get_cargo_projects(b: Bencher, n: usize) {
-    let setup = BenchmarkSetup::new(n);
-    let path_to_bench = setup.path();
+#[divan::bench(name = "clean_dir (fast)")]
+fn bench_clean_dir_fast(b: Bencher) {
+    let rt = Builder::new_current_thread().enable_all().build().unwrap();
 
-    b.bench(|| {
-        black_box(get_cargo_projects(black_box(path_to_bench)).unwrap());
-    });
+    b.with_inputs(|| {
+        let temp_dir = setup_test(1).unwrap();
+        let dirs = rt.block_on(get_cargo_projects(temp_dir.path())).unwrap();
+
+        (temp_dir, dirs[0].clone())
+    })
+    .bench_local_refs(|(_t, dir)| black_box(rt.block_on(clean_dir(dir, true, false)).unwrap()));
+}
+
+#[divan::bench(name = "get_cargo_projects", args = ARGS)]
+fn bench_get_cargo_projects(b: Bencher, n: usize) {
+    let rt = Builder::new_current_thread().enable_all().build().unwrap();
+
+    b.with_inputs(|| setup_test(n).unwrap())
+        .bench_local_refs(|dir| black_box(rt.block_on(get_cargo_projects(dir.path())).unwrap()));
+}
+
+// TODO consider if its worth making this non-blocking/async
+fn setup_test(n: usize) -> Result<TempDir> {
+    let temp_dir = tempdir()?;
+    let temp_path = temp_dir.path();
+
+    for i in 0..n {
+        let dir = temp_path.join(format!("dir{i}"));
+        create_dir_all(&dir)?;
+
+        std::fs::write(
+            dir.join("Cargo.toml"),
+            b"[package]\nname = \"test-proj\"\nversion = \"0.1.0\"\nedition = \"2024\"",
+        )?;
+
+        let src_dir = dir.join("src");
+        create_dir_all(&src_dir)?;
+
+        std::fs::write(src_dir.join("main.rs"), b"fn main() {}")?;
+
+        create_dir_all(dir.join("target"))?;
+    }
+
+    Ok(temp_dir)
 }
