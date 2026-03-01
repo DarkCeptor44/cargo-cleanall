@@ -52,3 +52,6 @@ harness = false
 name = "cargo-cleanall"
 required-features = ["cli"]
 path = "src/main.rs"
+
+[package.metadata.tokioreplacer]
+keep_tokio = true
