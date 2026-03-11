@@ -131,9 +131,13 @@ async fn clean_all(root: PathBuf, fast: bool, dry_run: bool, limit: usize) -> Re
 
     let paths_len = paths.len();
     let pb = ProgressBar::new(paths_len.try_into()?);
-    pb.set_style(ProgressStyle::default_bar().template(
-        "{spinner:.green} [{elapsed_precise}] [{bar:40.cyan/blue}] {pos}/{len} ({eta})",
-    )?);
+    pb.set_style(
+        ProgressStyle::default_bar()
+            .template(
+                "{spinner:.green} [{elapsed:.green}] [{bar:40.green/lime}] {pos}/{len} {eta}",
+            )?
+            .progress_chars("=> "),
+    );
 
     let semaphore = Arc::new(Semaphore::new(limit));
     let mut set: JoinSet<Result<(PathBuf, bool)>> = JoinSet::new();
